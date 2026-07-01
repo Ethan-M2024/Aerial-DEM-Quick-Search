@@ -20,7 +20,7 @@
   #status { padding: 12px 24px; color: #9aa; }
   #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px; padding: 24px; }
   .card { background: #171a21; border: 1px solid #262a33; border-radius: 10px; overflow: hidden; }
-  .card img { width: 100%; display: block; background: #000; aspect-ratio: 1; object-fit: cover; }
+  .card img { width: 100%; display: block; background: #000; aspect-ratio: 1; object-fit: contain; }
   .meta { padding: 10px 12px; font-size: 13px; }
   .meta .date { font-weight: 600; }
   .meta .sub { color: #9aa; font-size: 12px; margin-top: 2px; }
@@ -60,7 +60,7 @@
 <div id="status">Load an area of interest to begin.</div>
 <div id="grid"></div>
 <script>
-let AOI = null;
+let AOI_ID = null;
 const $ = (id) => document.getElementById(id);
 const grid = $('grid'), status = $('status');
 const btns = ['upload','search','peryear','demBtn'].map($);
@@ -71,8 +71,8 @@ function card(s) {
   c.className = 'card';
   const cloud = (s.cloud === null || s.cloud === undefined) ? '' : ' · cloud ' + s.cloud + '%';
   const gsd = s.gsd ? ' · ' + s.gsd + ' m/px' : '';
-  const size = s.size_mb ? ' (' + s.size_mb + ' MB)' : '';
-  const dl = s.download ? '<div class="sub"><a href="' + s.download + '" target="_blank">download GeoTIFF' + size + ' ↗</a></div>' : '';
+  const size = s.size_mb ? ' (' + s.size_mb + ' MB, full tile)' : '';
+  const dl = s.download ? '<div class="sub"><a href="' + s.download + '">⬇ download GeoTIFF' + size + '</a></div>' : '';
   const head = s.label ? '<div class="meta"><div class="date">' + s.label + '</div></div>' : '';
   c.innerHTML = head +
     '<a href="' + s.preview + '" target="_blank"><img loading="lazy" src="' + s.preview + '"></a>' +
@@ -82,7 +82,7 @@ function card(s) {
 }
 
 async function run(label, fn) {
-  if (!AOI) { status.textContent = 'Upload an area of interest first.'; return; }
+  if (!AOI_ID) { status.textContent = 'Upload an area of interest first.'; return; }
   disable(true); grid.innerHTML = ''; status.textContent = label + '… (can take up to a minute)';
   try {
     const data = await fn();
@@ -111,7 +111,7 @@ $('upload').addEventListener('click', async () => {
     const d = await r.json();
     if (d.error) { $('aoi').textContent = ''; status.textContent = 'Error: ' + d.error; }
     else {
-      AOI = d.geometry;
+      AOI_ID = d.aoi_id;
       const b = d.bbox.map(n => n.toFixed(4));
       $('aoi').textContent = '✓ Area loaded. Bounds: ' + b.join(', ');
       status.textContent = 'Area ready. Choose a source and search.';
@@ -121,17 +121,17 @@ $('upload').addEventListener('click', async () => {
 });
 
 $('search').addEventListener('click', () => run('Finding best imagery', () => postJSON('/api/search', {
-  geometry: AOI, source: $('source').value, start: $('start').value, end: $('end').value,
+  aoi_id: AOI_ID, source: $('source').value, start: $('start').value, end: $('end').value,
   max_cloud: $('max_cloud').value, best_per_year: false,
 })));
 
 $('peryear').addEventListener('click', () => run('Finding best scene per year', () => postJSON('/api/search', {
-  geometry: AOI, source: $('source').value, start: $('start').value, end: $('end').value,
+  aoi_id: AOI_ID, source: $('source').value, start: $('start').value, end: $('end').value,
   max_cloud: $('max_cloud').value, best_per_year: true,
 })));
 
 $('demBtn').addEventListener('click', () => run('Fetching elevation data', () => postJSON('/api/dem', {
-  geometry: AOI, dem: $('dem').value,
+  aoi_id: AOI_ID, dem: $('dem').value,
 })));
 </script>
 </body>

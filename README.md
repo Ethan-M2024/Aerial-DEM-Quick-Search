@@ -53,8 +53,11 @@ Prefer plain pip? `pip install -r requirements.txt && python app.py`
 2. Pick an **imagery source**, **date range**, and **max cloud %**.
 3. **Find best** — all matching scenes, sorted clearest-first.
    **Best per year** — one top scene for each year in the range.
-4. **Get elevation** — DEM tiles for your area with GeoTIFF download links.
-5. Click any preview to open it full size.
+4. **Get elevation** — DEM for your area.
+5. **Download** — every result has a ⬇ link:
+   - Imagery + global DEM (Sentinel/Landsat/NAIP/Copernicus/NASADEM):
+     **GeoTIFF clipped to your shapefile**.
+   - USGS 1/3/10 m DEM: the original full lidar tiles (GeoTIFF).
 
-Previews are quick-look PNGs. Use the download links (DEM) or the scene IDs on
-Planetary Computer for full-resolution GeoTIFFs.
+Previews are **clipped to your uploaded shape** — everything outside the polygon
+is masked out. Click a preview to open it full size.

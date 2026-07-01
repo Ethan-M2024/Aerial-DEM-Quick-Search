@@ -14,16 +14,22 @@ Then open http://127.0.0.1:5000
 """
 import argparse
 import io
-import json
 import tempfile
+import uuid
 import zipfile
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 
 import geopandas as gpd
 import requests
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request
 from shapely.geometry import mapping, shape
 
 STAC = "https://planetarycomputer.microsoft.com/api/stac/v1/search"
+# Planetary Computer dynamic tiler — crops/masks a single item to a GeoJSON.
+CROP = "https://planetarycomputer.microsoft.com/api/data/v1/item/crop"
+
+# Uploaded areas of interest, kept in memory for this run: id -> GeoJSON geometry.
+AOI_STORE = {}
 
 # Imagery sources, ordered highest-resolution first.
 # gsd = ground sample distance (meters/pixel). Lower = sharper.
@@ -106,17 +112,37 @@ def stac_search(collections, geometry, start=None, end=None, max_cloud=None,
     return features
 
 
-def to_rows(features, source_gsd, has_cloud):
+def render_params(feature):
+    """Pull the visualization query (assets, rescale, colormap...) that
+    Planetary Computer uses for this item's preview, minus the format flag."""
+    href = feature["assets"].get("rendered_preview", {}).get("href")
+    if not href:
+        return None
+    pairs = [(k, v) for k, v in parse_qsl(urlsplit(href).query) if k != "format"]
+    return urlencode(pairs)
+
+
+def proxy_urls(aoi_id, render, name):
+    """Server-side crop endpoints: PNG for preview, GeoTIFF for download,
+    both masked to the uploaded shape."""
+    r = quote(render, safe="")
+    preview = f"/proxy?aoi={aoi_id}&r={r}&fmt=png"
+    download = f"/proxy?aoi={aoi_id}&r={r}&fmt=tif&name={quote(name)}.tif"
+    return preview, download
+
+
+def to_rows(features, source_gsd, has_cloud, aoi_id):
     seen, rows = set(), []
     for f in features:
         fid = f["id"]
         if fid in seen:
             continue
         seen.add(fid)
-        p = f["properties"]
-        preview = f["assets"].get("rendered_preview", {}).get("href")
-        if not preview:
+        render = render_params(f)
+        if not render:
             continue
+        p = f["properties"]
+        preview, download = proxy_urls(aoi_id, render, fid)
         cloud = p.get("eo:cloud_cover") if has_cloud else None
         rows.append({
             "date": (p.get("datetime") or "?")[:10],
@@ -125,6 +151,7 @@ def to_rows(features, source_gsd, has_cloud):
             "gsd": p.get("gsd", source_gsd),
             "scene_id": fid,
             "preview": preview,
+            "download": download,
         })
     return rows
 
@@ -148,18 +175,29 @@ def api_upload():
         return jsonify({"error": "No file uploaded."}), 400
     try:
         geom = geometry_from_upload(request.files["file"])
+        aoi_id = uuid.uuid4().hex
+        AOI_STORE[aoi_id] = geom
         b = shape(geom).bounds
-        return jsonify({"geometry": geom, "bbox": list(b)})
+        return jsonify({"aoi_id": aoi_id, "bbox": list(b)})
     except Exception as e:
         return jsonify({"error": str(e)}), 400
+
+
+def get_aoi(body):
+    geom = AOI_STORE.get(body.get("aoi_id"))
+    if geom is None:
+        raise KeyError("Area of interest not found — upload a shapefile first.")
+    return geom
 
 
 @app.route("/api/search", methods=["POST"])
 def api_search():
     body = request.get_json(force=True)
-    geometry = body.get("geometry")
-    if not geometry:
-        return jsonify({"error": "No area of interest. Upload a shapefile first."}), 400
+    try:
+        geometry = get_aoi(body)
+    except KeyError as e:
+        return jsonify({"error": str(e)}), 400
+    aoi_id = body["aoi_id"]
     src_key = body.get("source", "sentinel-2")
     src = SOURCES.get(src_key)
     if not src:
@@ -177,14 +215,14 @@ def api_search():
                 feats = stac_search(src["collections"], geometry,
                                     f"{year}-01-01", f"{year}-12-31",
                                     max_cloud, src["has_cloud"])
-                rows = rank_best(to_rows(feats, src["gsd"], src["has_cloud"]))
+                rows = rank_best(to_rows(feats, src["gsd"], src["has_cloud"], aoi_id))
                 if rows:
                     best = dict(rows[0]); best["label"] = str(year)
                     out.append(best)
             return jsonify({"scenes": out})
         feats = stac_search(src["collections"], geometry, start, end,
                             max_cloud, src["has_cloud"])
-        rows = rank_best(to_rows(feats, src["gsd"], src["has_cloud"]))
+        rows = rank_best(to_rows(feats, src["gsd"], src["has_cloud"], aoi_id))
         return jsonify({"scenes": rows, "count": len(rows)})
     except requests.RequestException as e:
         return jsonify({"error": str(e)}), 500
@@ -193,9 +231,10 @@ def api_search():
 @app.route("/api/dem", methods=["POST"])
 def api_dem():
     body = request.get_json(force=True)
-    geometry = body.get("geometry")
-    if not geometry:
-        return jsonify({"error": "No area of interest. Upload a shapefile first."}), 400
+    try:
+        geometry = get_aoi(body)
+    except KeyError as e:
+        return jsonify({"error": str(e)}), 400
     dem = DEM_SOURCES.get(body.get("dem", "usgs-1m"))
     if not dem:
         return jsonify({"error": "Unknown DEM source"}), 400
@@ -203,10 +242,34 @@ def api_dem():
         if dem["provider"] == "tnm":
             out = tnm_dem(geometry, dem["dataset"])
         else:
-            out = planetary_dem(geometry, dem["collections"])
+            out = planetary_dem(geometry, dem["collections"], body["aoi_id"])
         return jsonify({"tiles": out, "count": len(out)})
     except requests.RequestException as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/proxy")
+def proxy():
+    """Fetch a shape-clipped PNG (preview) or GeoTIFF (download) from the
+    Planetary Computer tiler and stream it back to the browser."""
+    aoi_id = request.args.get("aoi", "")
+    geom = AOI_STORE.get(aoi_id)
+    if geom is None:
+        return "Area of interest expired — re-upload your shapefile.", 404
+    render = unquote(request.args.get("r", ""))
+    fmt = request.args.get("fmt", "png")
+    ext = "tif" if fmt == "tif" else "png"
+    max_size = 4096 if fmt == "tif" else 1024
+    url = f"{CROP}.{ext}?{render}&max_size={max_size}"
+    feature = {"type": "Feature", "properties": {}, "geometry": geom}
+    up = requests.post(url, json=feature, timeout=180, stream=True)
+    headers = {}
+    if fmt == "tif":
+        fn = request.args.get("name", "download.tif")
+        headers["Content-Disposition"] = f'attachment; filename="{fn}"'
+    return Response(up.iter_content(8192), status=up.status_code,
+                    content_type=up.headers.get("content-type", "application/octet-stream"),
+                    headers=headers)
 
 
 def tnm_dem(geometry, dataset):
@@ -232,17 +295,21 @@ def tnm_dem(geometry, dataset):
     return out
 
 
-def planetary_dem(geometry, collections):
+def planetary_dem(geometry, collections, aoi_id):
     feats = stac_search(collections, geometry, has_cloud=False, limit=20)
     out = []
     for f in feats:
-        a = f["assets"]
+        render = render_params(f)
+        if not render:
+            continue
+        preview, download = proxy_urls(aoi_id, render, f["id"])
         out.append({
             "date": (f["properties"].get("datetime") or "?")[:10],
             "scene_id": f["id"],
-            "preview": a.get("rendered_preview", {}).get("href"),
-            "download": (a.get("data") or a.get("elevation") or {}).get("href"),
+            "preview": preview,
+            "download": download,
             "gsd": f["properties"].get("gsd"),
+            "clipped": True,
         })
     return out
 
