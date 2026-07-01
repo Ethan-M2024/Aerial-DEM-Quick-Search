@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SatSearch — best imagery & DEM for any area</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: system-ui, sans-serif; margin: 0; background: #0f1115; color: #e6e6e6; }
+  header { padding: 16px 24px; background: #171a21; position: sticky; top: 0; z-index: 5; border-bottom: 1px solid #262a33; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .hint { color: #9aa; font-size: 12px; margin-bottom: 12px; }
+  .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+  label { font-size: 12px; display: flex; flex-direction: column; gap: 4px; color: #9aa; }
+  input, select { background: #0f1115; border: 1px solid #333; color: #e6e6e6; padding: 6px 8px; border-radius: 6px; }
+  button { background: #3b82f6; color: #fff; border: 0; padding: 8px 16px; border-radius: 6px; cursor: pointer; }
+  button.alt { background: #10b981; }
+  button:disabled { opacity: .5; cursor: default; }
+  .aoi { font-size: 12px; color: #10b981; margin-top: 8px; min-height: 16px; }
+  #status { padding: 12px 24px; color: #9aa; }
+  #grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px; padding: 24px; }
+  .card { background: #171a21; border: 1px solid #262a33; border-radius: 10px; overflow: hidden; }
+  .card img { width: 100%; display: block; background: #000; aspect-ratio: 1; object-fit: cover; }
+  .meta { padding: 10px 12px; font-size: 13px; }
+  .meta .date { font-weight: 600; }
+  .meta .sub { color: #9aa; font-size: 12px; margin-top: 2px; }
+  .meta a { color: #60a5fa; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SatSearch — clearest, highest-resolution imagery & DEM for any area</h1>
+  <div class="hint">No login. Public Microsoft Planetary Computer data. Satellites begin 1972; Sentinel-2 2015; NAIP aerial ~2010 (US).</div>
+  <div class="row">
+    <label>Area of interest (zipped shapefile or .geojson)
+      <input type="file" id="file" accept=".zip,.geojson,.json">
+    </label>
+    <button type="button" id="upload">Load area</button>
+  </div>
+  <div class="aoi" id="aoi"></div>
+  <div class="row" style="margin-top:12px;">
+    <label>Imagery source
+      <select id="source">
+        {% for k, s in sources.items() %}<option value="{{k}}" {% if k=='sentinel-2' %}selected{% endif %}>{{s.label}}</option>{% endfor %}
+      </select>
+    </label>
+    <label>Start<input type="date" id="start" value="2015-01-01"></label>
+    <label>End<input type="date" id="end" value="2026-12-31"></label>
+    <label>Max cloud %<input type="number" id="max_cloud" value="10" min="0" max="100" step="1"></label>
+    <button type="button" id="search">Find best</button>
+    <button type="button" id="peryear">Best per year</button>
+    <label>DEM
+      <select id="dem">
+        {% for k, d in dems.items() %}<option value="{{k}}">{{d.label}}</option>{% endfor %}
+      </select>
+    </label>
+    <button type="button" id="demBtn" class="alt">Get elevation</button>
+  </div>
+</header>
+<div id="status">Load an area of interest to begin.</div>
+<div id="grid"></div>
+<script>
+let AOI = null;
+const $ = (id) => document.getElementById(id);
+const grid = $('grid'), status = $('status');
+const btns = ['upload','search','peryear','demBtn'].map($);
+const disable = (v) => btns.forEach(b => b.disabled = v);
+
+function card(s) {
+  const c = document.createElement('div');
+  c.className = 'card';
+  const cloud = (s.cloud === null || s.cloud === undefined) ? '' : ' · cloud ' + s.cloud + '%';
+  const gsd = s.gsd ? ' · ' + s.gsd + ' m/px' : '';
+  const size = s.size_mb ? ' (' + s.size_mb + ' MB)' : '';
+  const dl = s.download ? '<div class="sub"><a href="' + s.download + '" target="_blank">download GeoTIFF' + size + ' ↗</a></div>' : '';
+  const head = s.label ? '<div class="meta"><div class="date">' + s.label + '</div></div>' : '';
+  c.innerHTML = head +
+    '<a href="' + s.preview + '" target="_blank"><img loading="lazy" src="' + s.preview + '"></a>' +
+    '<div class="meta"><div class="date">' + (s.date || '') + '</div>' +
+    '<div class="sub">' + (s.satellite || '') + cloud + gsd + '</div>' + dl + '</div>';
+  return c;
+}
+
+async function run(label, fn) {
+  if (!AOI) { status.textContent = 'Upload an area of interest first.'; return; }
+  disable(true); grid.innerHTML = ''; status.textContent = label + '… (can take up to a minute)';
+  try {
+    const data = await fn();
+    if (data.error) { status.textContent = 'Error: ' + data.error; }
+    else {
+      const items = data.scenes || data.tiles || [];
+      status.textContent = items.length + ' results';
+      items.forEach(s => grid.appendChild(card(s)));
+    }
+  } catch (e) { status.textContent = 'Request failed: ' + e; }
+  disable(false);
+}
+
+async function postJSON(url, payload) {
+  const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+  return r.json();
+}
+
+$('upload').addEventListener('click', async () => {
+  const f = $('file').files[0];
+  if (!f) { status.textContent = 'Choose a file first.'; return; }
+  disable(true); status.textContent = 'Reading area…';
+  const fd = new FormData(); fd.append('file', f);
+  try {
+    const r = await fetch('/api/upload', {method:'POST', body: fd});
+    const d = await r.json();
+    if (d.error) { $('aoi').textContent = ''; status.textContent = 'Error: ' + d.error; }
+    else {
+      AOI = d.geometry;
+      const b = d.bbox.map(n => n.toFixed(4));
+      $('aoi').textContent = '✓ Area loaded. Bounds: ' + b.join(', ');
+      status.textContent = 'Area ready. Choose a source and search.';
+    }
+  } catch (e) { status.textContent = 'Upload failed: ' + e; }
+  disable(false);
+});
+
+$('search').addEventListener('click', () => run('Finding best imagery', () => postJSON('/api/search', {
+  geometry: AOI, source: $('source').value, start: $('start').value, end: $('end').value,
+  max_cloud: $('max_cloud').value, best_per_year: false,
+})));
+
+$('peryear').addEventListener('click', () => run('Finding best scene per year', () => postJSON('/api/search', {
+  geometry: AOI, source: $('source').value, start: $('start').value, end: $('end').value,
+  max_cloud: $('max_cloud').value, best_per_year: true,
+})));
+
+$('demBtn').addEventListener('click', () => run('Fetching elevation data', () => postJSON('/api/dem', {
+  geometry: AOI, dem: $('dem').value,
+})));
+</script>
+</body>
+</html>

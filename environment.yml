@@ -1,0 +1,10 @@
+name: satsearch
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - flask>=3.0
+  - requests
+  - geopandas
+  - shapely
+  - pyogrio
