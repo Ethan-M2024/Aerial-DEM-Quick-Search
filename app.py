@@ -40,7 +40,7 @@ SOURCES = {
         "gsd": 0.6, "has_cloud": False, "since": "2010",
     },
     "sentinel-2": {
-        "label": "Sentinel-2 (10 m, 2015+)",
+        "label": "Sentinel-2 (10 m, 2015-2026) — best 10 m",
         "collections": ["sentinel-2-l2a"],
         "gsd": 10, "has_cloud": True, "since": "2015",
     },
@@ -131,22 +131,50 @@ def proxy_urls(aoi_id, render, name):
     return preview, download
 
 
-def to_rows(features, source_gsd, has_cloud, aoi_id):
+# Landsat 7's scan-line corrector failed 2003-05-31; scenes after that date
+# have the diagonal black stripes. We drop them so imagery stays clean.
+SLC_OFF_DATE = "2003-05-31"
+
+
+def aoi_coverage(feature, aoi_shape, aoi_area):
+    """Fraction of the AOI that this scene's footprint actually covers.
+    Cheap ratio in lon/lat degrees — good enough to reject swath-edge scenes."""
+    geom = feature.get("geometry")
+    if not geom or aoi_area <= 0:
+        return 1.0
+    try:
+        return shape(geom).intersection(aoi_shape).area / aoi_area
+    except Exception:
+        return 1.0
+
+
+def to_rows(features, source_gsd, has_cloud, aoi_id, min_coverage=0.98,
+            drop_slc_off=True):
+    aoi_shape = shape(AOI_STORE[aoi_id])
+    aoi_area = aoi_shape.area
     seen, rows = set(), []
     for f in features:
         fid = f["id"]
         if fid in seen:
             continue
         seen.add(fid)
+        p = f["properties"]
+        platform = p.get("platform") or p.get("constellation") or ""
+        date = (p.get("datetime") or "?")[:10]
+        # Quality gate 1: skip Landsat 7 SLC-off (black stripes).
+        if drop_slc_off and platform == "landsat-7" and date > SLC_OFF_DATE:
+            continue
+        # Quality gate 2: skip scenes that barely overlap the area (nodata edges).
+        if aoi_coverage(f, aoi_shape, aoi_area) < min_coverage:
+            continue
         render = render_params(f)
         if not render:
             continue
-        p = f["properties"]
         preview, download = proxy_urls(aoi_id, render, fid)
         cloud = p.get("eo:cloud_cover") if has_cloud else None
         rows.append({
-            "date": (p.get("datetime") or "?")[:10],
-            "satellite": p.get("platform") or p.get("constellation") or "",
+            "date": date,
+            "satellite": platform,
             "cloud": round(float(cloud), 1) if cloud is not None else None,
             "gsd": p.get("gsd", source_gsd),
             "scene_id": fid,

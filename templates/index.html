@@ -30,7 +30,7 @@
 <body>
 <header>
   <h1>SatSearch — clearest, highest-resolution imagery & DEM for any area</h1>
-  <div class="hint">No login. Public Microsoft Planetary Computer data. Satellites begin 1972; Sentinel-2 2015; NAIP aerial ~2010 (US).</div>
+  <div class="hint">No login. Public Microsoft Planetary Computer data. <b>True 10 m only exists 2015+ (Sentinel-2)</b>; 2000-2015 best free is Landsat 30 m. NAIP aerial ~0.6 m (US, ~2010+). Landsat 7 SLC-off scenes (black stripes) and swath-edge scenes are filtered out automatically.</div>
   <div class="row">
     <label>Area of interest (zipped shapefile or .geojson)
       <input type="file" id="file" accept=".zip,.geojson,.json">
@@ -44,7 +44,7 @@
         {% for k, s in sources.items() %}<option value="{{k}}" {% if k=='sentinel-2' %}selected{% endif %}>{{s.label}}</option>{% endfor %}
       </select>
     </label>
-    <label>Start<input type="date" id="start" value="2015-01-01"></label>
+    <label>Start<input type="date" id="start" value="2015-06-01"></label>
     <label>End<input type="date" id="end" value="2026-12-31"></label>
     <label>Max cloud %<input type="number" id="max_cloud" value="10" min="0" max="100" step="1"></label>
     <button type="button" id="search">Find best</button>

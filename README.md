@@ -31,6 +31,19 @@ API as downloadable GeoTIFF tiles. Global fallback from Planetary Computer.
 > Note: no satellite imagery exists before 1972. "Best per year" starts at each
 > source's first year.
 
+### Resolution over time (important)
+**True 10 m only exists from 2015** (Sentinel-2). There is no free 10 m optical
+imagery for 2000-2015 — the best free option there is Landsat at 30 m. For the
+sharpest possible view of the recent past use **Sentinel-2 (10 m, 2015-2026)**;
+for earlier years use Landsat.
+
+### Automatic quality filtering
+- **Landsat 7 SLC-off scenes are dropped.** After 2003-05-31 Landsat 7's scan-line
+  corrector failed, leaving diagonal black stripes. Those scenes are skipped, so
+  2003-2013 falls back to Landsat 5 and 2013+ uses Landsat 8/9.
+- **Swath-edge scenes are dropped.** Any scene whose footprint covers less than
+  98% of your area (causing black nodata gaps) is filtered out.
+
 ## Run it (Anaconda Prompt)
 
 Clone, then three commands:
