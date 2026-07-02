@@ -38,6 +38,7 @@ SOURCES = {
         "label": "NAIP aerial (US only, ~0.6 m)",
         "collections": ["naip"],
         "gsd": 0.6, "has_cloud": False, "since": "2010",
+        "mosaic": True,  # many small tiles per area — don't apply coverage filter
     },
     "sentinel-2": {
         "label": "Sentinel-2 (10 m, 2015-2026) — best 10 m",
@@ -184,6 +185,17 @@ def to_rows(features, source_gsd, has_cloud, aoi_id, min_coverage=0.98,
     return rows
 
 
+def build_rows(feats, src, aoi_id):
+    """Rows with quality filtering, but never let the filter alone return
+    nothing — if it removes everything, fall back to the unfiltered scenes."""
+    if src.get("mosaic"):
+        return to_rows(feats, src["gsd"], src["has_cloud"], aoi_id, min_coverage=0.0)
+    rows = to_rows(feats, src["gsd"], src["has_cloud"], aoi_id, min_coverage=0.6)
+    if not rows:
+        rows = to_rows(feats, src["gsd"], src["has_cloud"], aoi_id, min_coverage=0.0)
+    return rows
+
+
 def rank_best(rows):
     """Best = least cloud first, then sharpest (smallest gsd)."""
     return sorted(rows, key=lambda r: (
@@ -243,14 +255,14 @@ def api_search():
                 feats = stac_search(src["collections"], geometry,
                                     f"{year}-01-01", f"{year}-12-31",
                                     max_cloud, src["has_cloud"])
-                rows = rank_best(to_rows(feats, src["gsd"], src["has_cloud"], aoi_id))
+                rows = rank_best(build_rows(feats, src, aoi_id))
                 if rows:
                     best = dict(rows[0]); best["label"] = str(year)
                     out.append(best)
             return jsonify({"scenes": out})
         feats = stac_search(src["collections"], geometry, start, end,
                             max_cloud, src["has_cloud"])
-        rows = rank_best(to_rows(feats, src["gsd"], src["has_cloud"], aoi_id))
+        rows = rank_best(build_rows(feats, src, aoi_id))
         return jsonify({"scenes": rows, "count": len(rows)})
     except requests.RequestException as e:
         return jsonify({"error": str(e)}), 500
