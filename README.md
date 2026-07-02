@@ -63,6 +63,11 @@ Prefer plain pip? `pip install -r requirements.txt && python app.py`
 
 1. **Load area** — upload a **zipped shapefile** (`.shp` + `.shx` + `.dbf` +
    `.prj`, all zipped into one `.zip`) or a `.geojson` file.
+
+> **NAIP** is delivered as thousands of small tiles. SatSearch automatically
+> **merges the tiles into one seamless image per acquisition year**, clipped to
+> your shape — you get the whole area, not a single tile. The download is a
+> georeferenced GeoTIFF (EPSG:3857).
 2. Pick an **imagery source**, **date range**, and **max cloud %**.
 3. **Find best** — all matching scenes, sorted clearest-first.
    **Best per year** — one top scene for each year in the range.

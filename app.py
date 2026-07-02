@@ -14,19 +14,33 @@ Then open http://127.0.0.1:5000
 """
 import argparse
 import io
+import math
 import tempfile
 import uuid
 import zipfile
+from io import BytesIO
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit
 
 import geopandas as gpd
+import numpy as np
+import rasterio
 import requests
 from flask import Flask, Response, jsonify, render_template, request
+from PIL import Image, ImageChops, ImageDraw
+from rasterio.io import MemoryFile
+from rasterio.transform import Affine
 from shapely.geometry import mapping, shape
 
 STAC = "https://planetarycomputer.microsoft.com/api/stac/v1/search"
 # Planetary Computer dynamic tiler — crops/masks a single item to a GeoJSON.
 CROP = "https://planetarycomputer.microsoft.com/api/data/v1/item/crop"
+# Mosaic tiler — merges many tiles (e.g. NAIP) into one seamless layer.
+MOSAIC_REGISTER = "https://planetarycomputer.microsoft.com/api/data/v1/mosaic/register"
+MOSAIC_TILES = "https://planetarycomputer.microsoft.com/api/data/v1/mosaic"
+TILE = 256
+EARTH_R = 6378137.0
+# NAIP render: natural-colour RGB from the 4-band "image" asset.
+NAIP_ASSETS = "assets=image&asset_bidx=image%7C1%2C2%2C3"
 
 # Uploaded areas of interest, kept in memory for this run: id -> GeoJSON geometry.
 AOI_STORE = {}
@@ -130,6 +144,116 @@ def proxy_urls(aoi_id, render, name):
     preview = f"/proxy?aoi={aoi_id}&r={r}&fmt=png"
     download = f"/proxy?aoi={aoi_id}&r={r}&fmt=tif&name={quote(name)}.tif"
     return preview, download
+
+
+# ---- Mosaic stitching (for tiled sources like NAIP) ---------------------
+# NAIP arrives as thousands of small tiles. To show a whole area we register a
+# mosaic, fetch the web-map tiles that cover the area, stitch them into one
+# image, crop and mask to the uploaded shape, and (for download) georeference.
+
+def _lonlat_to_px(lon, lat, z):
+    """Global Web-Mercator pixel coords at zoom z."""
+    n = 2 ** z
+    x = (lon + 180.0) / 360.0 * n * TILE
+    s = math.sin(math.radians(lat))
+    y = (0.5 - math.log((1 + s) / (1 - s)) / (4 * math.pi)) * n * TILE
+    return x, y
+
+
+def _choose_zoom(bounds, max_px=1536, zmax=18):
+    minx, miny, maxx, maxy = bounds
+    for z in range(zmax, 7, -1):
+        x0, y0 = _lonlat_to_px(minx, maxy, z)
+        x1, y1 = _lonlat_to_px(maxx, miny, z)
+        if max(abs(x1 - x0), abs(y1 - y0)) <= max_px:
+            return z
+    return 8
+
+
+def register_mosaic(collection, start, end):
+    body = {"filter-lang": "cql2-json", "filter": {"op": "and", "args": [
+        {"op": "=", "args": [{"property": "collection"}, collection]},
+        {"op": "anyinteracts", "args": [{"property": "datetime"},
+         {"interval": [f"{start}T00:00:00Z", f"{end}T23:59:59Z"]}]},
+    ]}}
+    r = requests.post(MOSAIC_REGISTER, json=body, timeout=60)
+    r.raise_for_status()
+    return r.json()["searchid"]
+
+
+def stitch_mosaic(searchid, collection, geometry, assets_qs, max_px=1536):
+    """Return (masked RGBA PIL image, rasterio Affine in EPSG:3857)."""
+    geom = shape(geometry)
+    minx, miny, maxx, maxy = geom.bounds
+    z = _choose_zoom((minx, miny, maxx, maxy), max_px)
+    px0, py0 = _lonlat_to_px(minx, maxy, z)   # top-left corner (global px)
+    px1, py1 = _lonlat_to_px(maxx, miny, z)   # bottom-right corner
+    tx0, ty0 = int(px0 // TILE), int(py0 // TILE)
+    tx1, ty1 = int(px1 // TILE), int(py1 // TILE)
+    canvas = Image.new("RGBA", ((tx1 - tx0 + 1) * TILE, (ty1 - ty0 + 1) * TILE))
+    base = f"{MOSAIC_TILES}/{searchid}/tiles/WebMercatorQuad"
+    for tx in range(tx0, tx1 + 1):
+        for ty in range(ty0, ty1 + 1):
+            u = f"{base}/{z}/{tx}/{ty}?collection={collection}&{assets_qs}"
+            rr = requests.get(u, timeout=60)
+            if rr.status_code != 200:
+                continue
+            try:
+                tile = Image.open(BytesIO(rr.content)).convert("RGBA")
+            except Exception:
+                continue
+            canvas.paste(tile, ((tx - tx0) * TILE, (ty - ty0) * TILE))
+    crop = canvas.crop((int(px0 - tx0 * TILE), int(py0 - ty0 * TILE),
+                        int(px1 - tx0 * TILE), int(py1 - ty0 * TILE)))
+    # Mask everything outside the polygon.
+    mask = Image.new("L", crop.size, 0)
+    draw = ImageDraw.Draw(mask)
+
+    def ring_px(coords):
+        return [(_lonlat_to_px(lon, lat, z)[0] - px0,
+                 _lonlat_to_px(lon, lat, z)[1] - py0) for lon, lat in coords]
+
+    polys = geom.geoms if geom.geom_type == "MultiPolygon" else [geom]
+    for poly in polys:
+        draw.polygon(ring_px(poly.exterior.coords), fill=255)
+        for interior in poly.interiors:
+            draw.polygon(ring_px(interior.coords), fill=0)
+    crop.putalpha(ImageChops.darker(crop.getchannel("A"), mask))
+    # Georeference in Web Mercator metres.
+    res = (2 * math.pi * EARTH_R) / (TILE * 2 ** z)
+    transform = Affine(res, 0, px0 * res - math.pi * EARTH_R,
+                       0, -res, math.pi * EARTH_R - py0 * res)
+    return crop, transform
+
+
+def geotiff_bytes(img, transform):
+    arr = np.array(img)
+    h, w = arr.shape[:2]
+    count = arr.shape[2]
+    with MemoryFile() as mem:
+        with mem.open(driver="GTiff", height=h, width=w, count=count,
+                      dtype="uint8", crs="EPSG:3857", transform=transform,
+                      compress="deflate") as dst:
+            for i in range(count):
+                dst.write(arr[:, :, i], i + 1)
+        return mem.read()
+
+
+def naip_rows(geometry, aoi_id, start, end):
+    """One merged, shape-clipped NAIP mosaic per acquisition year."""
+    feats = stac_search(["naip"], geometry, start, end, has_cloud=False, limit=250)
+    years = sorted({(f["properties"].get("datetime") or "")[:4]
+                    for f in feats if f["properties"].get("datetime")}, reverse=True)
+    rows = []
+    for y in years:
+        base = f"aoi={aoi_id}&collection=naip&year={y}&{NAIP_ASSETS}"
+        rows.append({
+            "date": y, "label": y, "satellite": "NAIP mosaic",
+            "cloud": None, "gsd": 0.6, "scene_id": f"naip-{y}",
+            "preview": f"/mosaic/preview?{base}",
+            "download": f"/mosaic/download?{base}&name=naip_{y}.tif",
+        })
+    return rows
 
 
 # Landsat 7's scan-line corrector failed 2003-05-31; scenes after that date
@@ -247,6 +371,9 @@ def api_search():
     max_cloud = float(body.get("max_cloud", 10))
     best_per_year = bool(body.get("best_per_year", False))
     try:
+        if src.get("mosaic"):  # NAIP: merge tiles into one image per year
+            rows = naip_rows(geometry, aoi_id, start, end)
+            return jsonify({"scenes": rows, "count": len(rows)})
         if best_per_year:
             out = []
             y0 = max(int(start[:4]), int(src["since"]))
@@ -286,6 +413,41 @@ def api_dem():
         return jsonify({"tiles": out, "count": len(out)})
     except requests.RequestException as e:
         return jsonify({"error": str(e)}), 500
+
+
+def _mosaic_image(args):
+    aoi_id = args.get("aoi", "")
+    geom = AOI_STORE.get(aoi_id)
+    if geom is None:
+        return None, None
+    collection = args.get("collection", "naip")
+    year = args.get("year", "2022")
+    assets = f"assets={args.get('assets', 'image')}"
+    if args.get("asset_bidx"):
+        assets += f"&asset_bidx={quote(args['asset_bidx'])}"
+    sid = register_mosaic(collection, f"{year}-01-01", f"{year}-12-31")
+    return stitch_mosaic(sid, collection, geom, assets)
+
+
+@app.route("/mosaic/preview")
+def mosaic_preview():
+    img, _ = _mosaic_image(request.args)
+    if img is None:
+        return "Area of interest expired — re-upload your shapefile.", 404
+    buf = BytesIO()
+    img.save(buf, "PNG")
+    return Response(buf.getvalue(), content_type="image/png")
+
+
+@app.route("/mosaic/download")
+def mosaic_download():
+    img, transform = _mosaic_image(request.args)
+    if img is None:
+        return "Area of interest expired — re-upload your shapefile.", 404
+    data = geotiff_bytes(img, transform)
+    fn = request.args.get("name", "mosaic.tif")
+    return Response(data, content_type="image/tiff",
+                    headers={"Content-Disposition": f'attachment; filename="{fn}"'})
 
 
 @app.route("/proxy")

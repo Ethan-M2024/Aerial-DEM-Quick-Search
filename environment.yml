@@ -8,3 +8,6 @@ dependencies:
   - geopandas
   - shapely
   - pyogrio
+  - rasterio
+  - pillow
+  - numpy

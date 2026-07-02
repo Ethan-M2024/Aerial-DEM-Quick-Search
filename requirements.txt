@@ -3,3 +3,6 @@ requests
 geopandas
 shapely
 pyogrio
+rasterio
+pillow
+numpy
