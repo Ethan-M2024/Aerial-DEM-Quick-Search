@@ -25,6 +25,7 @@ import geopandas as gpd
 import numpy as np
 import rasterio
 import requests
+import shapely
 from flask import Flask, Response, jsonify, render_template, request
 from PIL import Image, ImageChops, ImageDraw
 from rasterio.io import MemoryFile
@@ -109,6 +110,7 @@ def geometry_from_upload(file_storage):
     if gdf.crs and gdf.crs.to_epsg() != 4326:
         gdf = gdf.to_crs(4326)
     merged = gdf.geometry.union_all()
+    merged = shapely.force_2d(merged)  # drop Z/M — mosaic masking only handles (lon, lat)
     return mapping(merged)
 
 
@@ -210,8 +212,10 @@ def stitch_mosaic(searchid, collection, geometry, assets_qs, max_px=1536):
     draw = ImageDraw.Draw(mask)
 
     def ring_px(coords):
-        return [(_lonlat_to_px(lon, lat, z)[0] - px0,
-                 _lonlat_to_px(lon, lat, z)[1] - py0) for lon, lat in coords]
+        # pt[0], pt[1] rather than unpacking: coords may carry a Z (or M)
+        # component if the shapefile is 3D despite our upload-time force_2d.
+        return [(_lonlat_to_px(pt[0], pt[1], z)[0] - px0,
+                 _lonlat_to_px(pt[0], pt[1], z)[1] - py0) for pt in coords]
 
     polys = geom.geoms if geom.geom_type == "MultiPolygon" else [geom]
     for poly in polys:
